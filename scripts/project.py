@@ -13,8 +13,16 @@ from sensor_msgs.msg import LaserScan
 from tf.transformations import euler_from_quaternion
 
 # Import your existing implementations
-from lab8_9 import Map, ParticleFilter, angle_to_neg_pi_to_pi  # :contentReference[oaicite:2]{index=2}
-from lab10 import RrtPlanner, PIDController as WaypointPID, GOAL_THRESHOLD  # :contentReference[oaicite:3]{index=3}
+from lab8_9_starter import (
+    Map,
+    ParticleFilter,
+    angle_to_neg_pi_to_pi,
+)
+from lab10_starter import (
+    RrtPlanner,
+    PIDController as WaypointPID,
+    GOAL_THRESHOLD,
+)
 
 
 class PFRRTController:
@@ -26,7 +34,9 @@ class PFRRTController:
          continuing to run the particle filter.
     """
 
-    def __init__(self, pf: ParticleFilter, planner: RrtPlanner, goal_position: Dict[str, float]):
+    def __init__(
+        self, pf: ParticleFilter, planner: RrtPlanner, goal_position: Dict[str, float]
+    ):
         self._pf = pf
         self._planner = planner
         self.goal_position = goal_position
@@ -54,7 +64,9 @@ class PFRRTController:
         self.rate = rospy.Rate(10)
 
         # Wait until we have initial odom + scan
-        while (self.current_position is None or self.laserscan is None) and (not rospy.is_shutdown()):
+        while (self.current_position is None or self.laserscan is None) and (
+            not rospy.is_shutdown()
+        ):
             rospy.loginfo("Waiting for /odom and /scan...")
             rospy.sleep(0.1)
 
@@ -107,7 +119,9 @@ class PFRRTController:
         start_time = rospy.Time.now().to_sec()
         r = rospy.Rate(10)
 
-        while (rospy.Time.now().to_sec() - start_time) < duration and (not rospy.is_shutdown()):
+        while (rospy.Time.now().to_sec() - start_time) < duration and (
+            not rospy.is_shutdown()
+        ):
             self.cmd_pub.publish(twist)
             r.sleep()
 
@@ -127,7 +141,9 @@ class PFRRTController:
         start_time = rospy.Time.now().to_sec()
         r = rospy.Rate(10)
 
-        while (rospy.Time.now().to_sec() - start_time) < duration and (not rospy.is_shutdown()):
+        while (rospy.Time.now().to_sec() - start_time) < duration and (
+            not rospy.is_shutdown()
+        ):
             self.cmd_pub.publish(twist)
             r.sleep()
 
@@ -140,8 +156,7 @@ class PFRRTController:
     # ----------------------------------------------------------------------
     def take_measurements(self):
         """
-        Use 3 beams (-15°, 0°, +15° in the robot frame) from /scan
-        to update the particle filter via its measurement model.
+        Use 5 beams (-15°, 0°, +15°, 90°, -90°) to heavily stabilize PF tracking!
         """
         if self.laserscan is None:
             return
@@ -151,20 +166,18 @@ class PFRRTController:
         ranges = self.laserscan.ranges
         num_ranges = len(ranges)
 
-        mid_idx = num_ranges // 2
-        offset = int(15.0 / (angle_increment * 180.0 / math.pi))  # 15 degrees offset
+        offset15 = int(15.0 / (angle_increment * 180.0 / math.pi))
+        offset90 = int(90.0 / (angle_increment * 180.0 / math.pi))
 
-        indices = [max(0, min(num_ranges - 1, mid_idx + i)) for i in (-offset, 0, offset)]
+        indices = [num_ranges - offset15, 0, offset15, num_ranges - offset90, offset90]
+
         measurements = []
-
         for idx in indices:
+            idx = idx % num_ranges
             z = ranges[idx]
-            if z == inf or np.isinf(z):
-                if hasattr(self.laserscan, "range_max"):
-                    z = self.laserscan.range_max
-                else:
-                    z = 10.0  # fallback
-            angle = angle_min + idx * angle_increment  # angle in robot frame
+            if z == inf or np.isinf(z) or math.isnan(z):
+                z = getattr(self.laserscan, "range_max", 10.0)
+            angle = angle_min + idx * angle_increment
             measurements.append((z, angle))
 
         for z, a in measurements:
@@ -180,12 +193,71 @@ class PFRRTController:
           - If obstacle close in front, back up and rotate.
         After each motion, apply PF measurement updates and check convergence.
         """
-        
+
         ######### Your code starts here #########
+        rospy.loginfo("Starting Phase 1: PF Localization...")
 
+        confidence_pos_thresh = 0.15
+        confidence_theta_thresh = 0.35
+
+        import random
+
+        for step in range(max_steps):
+            if rospy.is_shutdown():
+                break
+
+            self.take_measurements()
+            self._pf.resample()
+            self._pf.visualize_particles()
+            self._pf.visualize_estimate()
+
+            particles = self._pf._particles
+            if len(particles) > 0:
+                xs = [p.x for p in particles]
+                ys = [p.y for p in particles]
+                thetas = [p.theta for p in particles]
+
+                std_x = np.std(xs)
+                std_y = np.std(ys)
+
+                mean_sin = np.mean([math.sin(t) for t in thetas])
+                mean_cos = np.mean([math.cos(t) for t in thetas])
+                R = math.sqrt(mean_sin**2 + mean_cos**2)
+                theta_spread = 1.0 - R
+
+                if (
+                    std_x < confidence_pos_thresh
+                    and std_y < confidence_pos_thresh
+                    and theta_spread < confidence_theta_thresh
+                ):
+                    rospy.loginfo(f"PF converged legitimately at step {step}")
+                    break
+
+            scan = self.laserscan
+            if scan is None or len(scan.ranges) == 0:
+                self.rate.sleep()
+                continue
+
+            front_indices = list(range(0, 15)) + list(
+                range(len(scan.ranges) - 15, len(scan.ranges))
+            )
+            front_ranges = []
+            for i in front_indices:
+                z = scan.ranges[i]
+                if z != float("inf") and not math.isnan(z):
+                    front_ranges.append(z)
+
+            min_front = min(front_ranges) if len(front_ranges) > 0 else float("inf")
+
+            if min_front > 0.35:
+                self.move_forward(0.2)
+            else:
+                self.move_forward(-0.05)  # Backup clearance
+                turn_angle = random.choice([math.pi / 2, -math.pi / 2])
+                self.rotate_in_place(turn_angle)
+
+            self.rate.sleep()
         ######### Your code ends here #########
-
-        
 
     # ----------------------------------------------------------------------
     # Phase 2: Planning with RRT
@@ -195,7 +267,19 @@ class PFRRTController:
         Generate a path using RRT from PF-estimated start to known goal.
         """
         ######### Your code starts here #########
+        rospy.loginfo("Starting Phase 2: Planning with RRT...")
 
+        est_x, est_y, est_theta = self._pf.get_estimate()
+        start = {"x": est_x, "y": est_y, "theta": est_theta}
+
+        self.plan, graph = self._planner.generate_plan(start, self.goal_position)
+
+        self._planner.visualize_graph(graph)
+        self._planner.visualize_plan(self.plan)
+
+        self.current_wp_idx = 0
+        plan_length = len(self.plan) if self.plan else 0
+        rospy.loginfo(f"Phase 2 complete. Plan length: {plan_length}")
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -207,7 +291,61 @@ class PFRRTController:
         Keep updating PF along the way.
         """
         ######### Your code starts here #########
+        rospy.loginfo("Starting Phase 3: Following Plan...")
+        plan_list = self.plan
+        if not plan_list:
+            rospy.logwarn("No plan to follow.")
+            return
 
+        ctrl_msg = Twist()
+        step_counter = 0
+
+        while not rospy.is_shutdown():
+            if self.current_wp_idx >= len(plan_list):
+                ctrl_msg.linear.x = 0.0
+                ctrl_msg.angular.z = 0.0
+                self.cmd_pub.publish(ctrl_msg)
+                rospy.loginfo("Reached the goal!")
+                break
+
+            step_counter += 1
+            if step_counter % 5 == 0:
+                self.take_measurements()
+                self._pf.resample()
+
+            self._pf.visualize_particles()
+            self._pf.visualize_estimate()
+
+            goal = plan_list[self.current_wp_idx]
+
+            # We distance-track AND angle-track against the Global Map (Particle Filter) to eliminate drift...
+            est_x, est_y, est_theta = self._pf.get_estimate()
+            dx = goal["x"] - est_x
+            dy = goal["y"] - est_y
+            distance_error = math.hypot(dx, dy)
+            target_theta = math.atan2(dy, dx)
+
+            # CORRECT angle_error computation (Global Target Angle vs Global PF Robot Angle)
+            angle_error = angle_to_neg_pi_to_pi(target_theta - est_theta)
+
+            if distance_error < 0.15:
+                rospy.loginfo(f"Reached waypoint {self.current_wp_idx}")
+                self.current_wp_idx += 1
+                continue
+
+            t = rospy.get_time()
+            u_w = self.angular_pid.control(angle_error, t)
+
+            # Exactly Lab 10's 0.7 bound
+            if abs(angle_error) > 0.7:
+                u_v = 0.0
+            else:
+                u_v = self.linear_pid.control(distance_error, t)
+
+            ctrl_msg.linear.x = u_v
+            ctrl_msg.angular.z = u_w
+            self.cmd_pub.publish(ctrl_msg)
+            self.rate.sleep()
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -237,10 +375,10 @@ if __name__ == "__main__":
 
     # Build map + PF + RRT
     map_obj = Map(obstacles, map_aabb)
-    num_particles = 200
+    num_particles = 300
     translation_variance = 0.003
     rotation_variance = 0.03
-    measurement_variance = 0.35
+    measurement_variance = 0.25
 
     pf = ParticleFilter(
         map_obj,
@@ -257,3 +395,4 @@ if __name__ == "__main__":
         controller.run()
     except rospy.ROSInterruptException:
         pass
+

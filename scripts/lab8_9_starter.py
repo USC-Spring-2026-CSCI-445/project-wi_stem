@@ -13,7 +13,16 @@ import scipy
 import numpy as np
 import rospy
 from std_msgs.msg import ColorRGBA
-from geometry_msgs.msg import Twist, Point32, PoseStamped, Pose, Vector3, Quaternion, Point, PoseArray
+from geometry_msgs.msg import (
+    Twist,
+    Point32,
+    PoseStamped,
+    Pose,
+    Vector3,
+    Quaternion,
+    Point,
+    PoseArray,
+)
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan, PointCloud, ChannelFloat32
 from visualization_msgs.msg import MarkerArray, Marker
@@ -100,7 +109,13 @@ class Map:
             width = aabb[1] - aabb[0]
             height = aabb[3] - aabb[2]
             rect = patches.Rectangle(
-                (aabb[0], aabb[2]), width, height, linewidth=2, edgecolor="r", facecolor="r", alpha=0.4
+                (aabb[0], aabb[2]),
+                width,
+                height,
+                linewidth=2,
+                edgecolor="r",
+                facecolor="r",
+                alpha=0.4,
             )
             ax.add_patch(rect)
         ax.set_xlim(x_min_global, x_max_global)
@@ -122,7 +137,9 @@ class Map:
                     plt.plot([origin[0], x], [origin[1], y], "b-")
         plt.show()
 
-    def closest_distance(self, origin: Tuple[float, float], angle: float) -> Optional[float]:
+    def closest_distance(
+        self, origin: Tuple[float, float], angle: float
+    ) -> Optional[float]:
         """Returns the closest distance to an obstacle from the given origin in the given direction `angle`. If no
         intersection is found, returns `None`.
         """
@@ -158,8 +175,57 @@ class Map:
                     result = min(result, dist)
         return result
 
+
 # PID controller class
 ######### Your code starts here #########
+class PIDController:
+    """
+    Generates control action taking into account instantaneous error (proportional action),
+    accumulated error (integral action) and rate of change of error (derivative action).
+    """
+
+    def __init__(self, kP, kI, kD, kS, u_min, u_max):
+        assert u_min < u_max, "u_min should be less than u_max"
+        # Initializa PID variables here
+        ######### Your code starts here #########
+        self.kP = kP
+        self.kI = kI
+        self.kD = kD
+        self.kS = kS
+
+        self.u_min = u_min
+        self.u_max = u_max
+
+        self.err_prev = 0.0
+        self.err_int = 0.0
+        self.t_prev = None
+
+        ######### Your code ends here #########
+
+    def control(self, err, t):
+        # compute PID control action here
+        ######### Your code starts here #########
+        if self.t_prev is None:
+            self.t_prev = t
+            self.err_prev = err
+            return 0.0
+
+        dt = t - self.t_prev
+        if dt <= 1e-6:
+            return 0.0
+
+        derr = (err - self.err_prev) / dt
+        self.err_int += err * dt
+        self.err_int = max(-self.kS, min(self.kS, self.err_int))
+
+        u = self.kP * err + self.kI * self.err_int + self.kD * derr
+        u = max(self.u_min, min(self.u_max, u))
+
+        self.err_prev = err
+        self.t_prev = t
+
+        return u
+
 
 ######### Your code ends here #########
 
@@ -176,7 +242,6 @@ class Particle:
 
 
 class ParticleFilter:
-
     def __init__(
         self,
         map_: Map,
@@ -185,11 +250,33 @@ class ParticleFilter:
         rotation_variance: float,
         measurement_variance: float,
     ):
-        self.particles_visualization_pub = rospy.Publisher("/pf_particles", PoseArray, queue_size=10)
-        self.estimate_visualization_pub = rospy.Publisher("/pf_estimate", PoseStamped, queue_size=10)
+        self.particles_visualization_pub = rospy.Publisher(
+            "/pf_particles", PoseArray, queue_size=10
+        )
+        self.estimate_visualization_pub = rospy.Publisher(
+            "/pf_estimate", PoseStamped, queue_size=10
+        )
 
         # Initialize uniformly-distributed particles
         ######### Your code starts here #########
+        self._map = map_
+        self._n_particles = n_particles
+        self._translation_variance = translation_variance
+        self._rotation_variance = rotation_variance
+        self._measurement_variance = measurement_variance
+
+        self._particles = []
+
+        x_min, x_max, y_min, y_max = self._map.map_aabb
+
+        for _ in range(self._n_particles):
+            x = np.random.uniform(x_min, x_max)
+            y = np.random.uniform(y_min, y_max)
+            theta = np.random.uniform(0, 2 * pi)
+
+            log_p = 0.0  # equal probability in log space
+
+            self._particles.append(Particle(x, y, theta, log_p))
 
         ######### Your code ends here #########
 
@@ -222,7 +309,21 @@ class ParticleFilter:
 
         # Propagate motion of each particle
         ######### Your code starts here #########
+        import math
 
+        d = math.hypot(delta_x, delta_y)
+
+        for p in self._particles:
+            d_noisy = np.random.normal(d, self._translation_variance) if d > 0 else 0.0
+            theta_noisy = (
+                np.random.normal(delta_theta, self._rotation_variance)
+                if delta_theta != 0
+                else 0.0
+            )
+
+            p.x += d_noisy * math.cos(p.theta)
+            p.y += d_noisy * math.sin(p.theta)
+            p.theta = angle_to_neg_pi_to_pi(p.theta + theta_noisy)
         ######### Your code ends here #########
 
     def measure(self, z: float, scan_angle_in_rad: float):
@@ -235,13 +336,55 @@ class ParticleFilter:
 
         # Calculate posterior probabilities and resample
         ######### Your code starts here #########
+        import math
 
+        for p in self._particles:
+            global_scan_angle = angle_to_neg_pi_to_pi(p.theta + scan_angle_in_rad)
+            expected_z = self._map.closest_distance((p.x, p.y), global_scan_angle)
+
+            if expected_z is not None:
+                p.log_p += scipy.stats.norm(
+                    loc=expected_z, scale=self._measurement_variance
+                ).logpdf(z)
+            else:
+                p.log_p += -math.inf
         ######### Your code ends here #########
+
+    def resample(self):
+        import math
+        import random
+
+        max_log_p = max(p.log_p for p in self._particles)
+        weights = [math.exp(p.log_p - max_log_p) for p in self._particles]
+
+        sampled_particles = random.choices(
+            self._particles, weights=weights, k=self._n_particles
+        )
+        self._particles = [Particle(p.x, p.y, p.theta, 0.0) for p in sampled_particles]
 
     def get_estimate(self) -> Tuple[float, float, float]:
         # Estimate robot's location using particle weights
         ######### Your code starts here #########
+        import math
 
+        max_log_p = max(p.log_p for p in self._particles)
+
+        if max_log_p == -math.inf:
+            weights = [1.0 / len(self._particles)] * len(self._particles)
+        else:
+            weights = [math.exp(p.log_p - max_log_p) for p in self._particles]
+
+        sum_weights = sum(weights)
+        weights = [w / sum_weights for w in weights]
+
+        est_x = sum(p.x * w for p, w in zip(self._particles, weights))
+        est_y = sum(p.y * w for p, w in zip(self._particles, weights))
+
+        sin_sum = sum(math.sin(p.theta) * w for p, w in zip(self._particles, weights))
+        cos_sum = sum(math.cos(p.theta) * w for p, w in zip(self._particles, weights))
+        est_theta = math.atan2(sin_sum, cos_sum)
+
+        return est_x, est_y, est_theta
         ######### Your code ends here #########
 
 
@@ -255,20 +398,34 @@ class Controller:
         self.current_position = None
         self.laserscan = None
         self.odom_sub = rospy.Subscriber("/odom", Odometry, self.odom_callback)
-        self.laserscan_sub = rospy.Subscriber("/scan", LaserScan, self.robot_laserscan_callback)
+        self.laserscan_sub = rospy.Subscriber(
+            "/scan", LaserScan, self.robot_laserscan_callback
+        )
         self.robot_ctrl_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-        self.pointcloud_pub = rospy.Publisher("/scan_pointcloud", PointCloud, queue_size=10)
-        self.target_position_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
+        self.pointcloud_pub = rospy.Publisher(
+            "/scan_pointcloud", PointCloud, queue_size=10
+        )
+        self.target_position_pub = rospy.Publisher(
+            "/waypoints", MarkerArray, queue_size=10
+        )
 
-        while ((self.current_position is None) or (self.laserscan is None)) and (not rospy.is_shutdown()):
+        while ((self.current_position is None) or (self.laserscan is None)) and (
+            not rospy.is_shutdown()
+        ):
             rospy.loginfo("waiting for odom and laserscan")
             rospy.sleep(0.1)
 
     def odom_callback(self, msg):
         pose = msg.pose.pose
         orientation = pose.orientation
-        _, _, theta = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
-        self.current_position = {"x": pose.position.x, "y": pose.position.y, "theta": theta}
+        _, _, theta = euler_from_quaternion(
+            [orientation.x, orientation.y, orientation.z, orientation.w]
+        )
+        self.current_position = {
+            "x": pose.position.x,
+            "y": pose.position.y,
+            "theta": theta,
+        }
 
     def robot_laserscan_callback(self, msg: LaserScan):
         self.laserscan = msg
@@ -286,7 +443,8 @@ class Controller:
             for idx, d in enumerate(self.laserscan.ranges[idx_low:idx_high]):
                 if d == inf:
                     continue
-                angle = math.radians(idx) + self.current_position["theta"]
+                true_idx = idx + idx_low
+                angle = math.radians(true_idx) + self.current_position["theta"]
                 x = d * math.cos(angle) + self.current_position["x"]
                 y = d * math.sin(angle) + self.current_position["y"]
                 z = 0.1
@@ -315,33 +473,164 @@ class Controller:
         ######### Your code starts here #########
         # NOTE: with more than 2 angles the particle filter will converge too quickly, so with high likelihood the
         # correct neighborhood won't be found.
+        import math
 
+        # Pick 2 angles as instructed, e.g., 0 degrees (front) and 90 degrees (left)
+        angles_to_check = [0, 90]
+
+        if self.laserscan is not None:
+            for deg in angles_to_check:
+                z = self.laserscan.ranges[deg]
+                # Ensure the reading is valid before updating the particle filter
+                if z != float("inf") and not math.isnan(z):
+                    self._particle_filter.measure(z, math.radians(deg))
+
+            # Resample once after updating log_p sequentially for all rays
+            self._particle_filter.resample()
+
+        # Update visualizations dynamically!
+        self._particle_filter.visualize_particles()
+        self._particle_filter.visualize_estimate()
         ######### Your code ends here #########
-
+        
     def autonomous_exploration(self):
-        """Randomly explore the environment here, while making sure to call `take_measurements()` and
-        `_particle_filter.move_by()`. The particle filter should converge on the robots position eventually.
+	    """Randomly explore the environment here, while making sure to call `take_measurements()` and
+	    `_particle_filter.move_by()`. The particle filter should converge on the robots position eventually.
 
-        Note that the following visualizations functions are available:
-            visualize_position(...)
-            visualize_laserscan_ranges(...)
-        """
-        # Robot autonomously explores environment while it localizes itself
-        ######### Your code starts here #########
+	    Note that the following visualizations functions are available:
+		    visualize_position(...)
+		    visualize_laserscan_ranges(...)
+	    """
+	    # Robot autonomously explores environment while it localizes itself
+	    ######### Your code starts here #########
+	    import math
+	    import random
 
-        ######### Your code ends here #########
+	    rate = rospy.Rate(2)  # slow enough to see behavior in sim
+
+	    # Tunable parameters
+	    forward_step = 0.2
+	    turn_angle_options = [math.pi / 2, -math.pi / 2]   # left or right 90 deg
+	    front_clearance = 0.35                             # must have this much room ahead
+	    confidence_pos_thresh = 0.15                       # meters
+	    confidence_theta_thresh = 0.35                     # radians
+	    max_steps = 200
+
+	    def particle_filter_confident():
+		    particles = self._particle_filter._particles
+		    if len(particles) == 0:
+			    return False
+
+		    xs = [p.x for p in particles]
+		    ys = [p.y for p in particles]
+		    thetas = [p.theta for p in particles]
+
+		    # position spread
+		    std_x = np.std(xs)
+		    std_y = np.std(ys)
+
+		    # heading spread using circular statistics
+		    mean_sin = np.mean([math.sin(t) for t in thetas])
+		    mean_cos = np.mean([math.cos(t) for t in thetas])
+		    R = math.sqrt(mean_sin**2 + mean_cos**2)
+		    theta_spread = 1.0 - R   # smaller means headings are clustered
+
+		    return (
+			    std_x < confidence_pos_thresh
+			    and std_y < confidence_pos_thresh
+			    and theta_spread < confidence_theta_thresh
+		    )
+
+	    for _ in range(max_steps):
+		    if rospy.is_shutdown():
+			    break
+
+		    # Always update PF from current sensor readings first
+		    self.take_measurements()
+
+		    # Visualize current estimate
+		    est_x, est_y, _ = self._particle_filter.get_estimate()
+		    self.visualize_position(est_x, est_y)
+
+		    # Stop once localized with high confidence
+		    if particle_filter_confident():
+			    rospy.loginfo("Particle filter confident. Stopping autonomous exploration.")
+			    stop_twist = Twist()
+			    self.robot_ctrl_pub.publish(stop_twist)
+			    break
+
+		    # Need a valid scan to decide motion
+		    if self.laserscan is None or len(self.laserscan.ranges) == 0:
+			    rate.sleep()
+			    continue
+
+		    # Check front region for collision risk
+		    front_indices = list(range(0, 15)) + list(range(345, 360))
+		    front_ranges = []
+		    for i in front_indices:
+			    z = self.laserscan.ranges[i]
+			    if z != float("inf") and not math.isnan(z):
+				    front_ranges.append(z)
+
+		    min_front = min(front_ranges) if len(front_ranges) > 0 else float("inf")
+
+		    # Simple exploration strategy:
+		    # if front is clear -> move forward
+		    # else -> rotate 90 degrees to a random side
+		    if min_front > front_clearance:
+			    self.forward_action(forward_step)
+		    else:
+			    turn_angle = random.choice(turn_angle_options)
+			    self.rotate_action(turn_angle)
+
+		    rate.sleep()
+
+	    # ensure robot is stopped at the end
+	    stop_twist = Twist()
+	    self.robot_ctrl_pub.publish(stop_twist)
+	    ######### Your code ends here #########
 
     def forward_action(self, distance: float):
-        # Robot moves forward by a set amount during manual control
-        ######### Your code starts here #########
+		# Robot moves forward by a set amount during manual control
+		######### Your code starts here #########
+        twist = Twist()
+        twist.linear.x = 0.2 if distance > 0 else -0.2
+        twist.angular.z = 0.0
+        
+        from time import time
+        
+        start_time = time()
+        duration = abs(distance) / abs(twist.linear.x)
+        while time() - start_time < duration and not rospy.is_shutdown():
+            self.robot_ctrl_pub.publish(twist)
+            rospy.sleep(0.01)  # Add a tiny sleep to not spam ROS at million cycles/sec
+        twist.linear.x = 0.0
+        self.robot_ctrl_pub.publish(twist)
 
+		# Notify the particle filter that the robot has just moved! 
+        self._particle_filter.move_by(distance, 0.0, 0.0)
         ######### Your code ends here #########
 
     def rotate_action(self, goal_theta: float):
         # Robot turns by a set amount during manual control
         ######### Your code starts here #########
-
-
+        twist = Twist()
+        twist.linear.x = 0.0
+        angular_speed = 0.5
+        twist.angular.z = angular_speed if goal_theta > 0 else -angular_speed
+        
+        from time import time
+        start_time = time()
+        duration = abs(goal_theta) / angular_speed
+        while time() - start_time < duration and not rospy.is_shutdown():
+            self.robot_ctrl_pub.publish(twist)
+            rospy.sleep(0.01)
+        
+        twist.angular.z = 0.0
+        self.robot_ctrl_pub.publish(twist)
+        
+        # Notify the particle filter that the robot has rotated!
+        self._particle_filter.move_by(0.0, 0.0, goal_theta)
         ######### Your code ends here #########
 
 
@@ -352,7 +641,6 @@ rosrun development lab8_9.py --map_filepath src/csci455l/scripts/lab8_9_map.json
 
 
 if __name__ == "__main__":
-
     parser = ArgumentParser()
     parser.add_argument("--map_filepath", type=str, required=True)
     args = parser.parse_args()
@@ -363,41 +651,19 @@ if __name__ == "__main__":
 
     map_ = Map(obstacles, map_aabb)
     num_particles = 200
-    translation_variance = 0.1
+    translation_variance = 0.01
     rotation_variance = 0.05
     measurement_variance = 0.1
-    particle_filter = ParticleFilter(map_, num_particles, translation_variance, rotation_variance, measurement_variance)
+    particle_filter = ParticleFilter(
+        map_,
+        num_particles,
+        translation_variance,
+        rotation_variance,
+        measurement_variance,
+    )
     controller = Controller(particle_filter)
 
     try:
-        # Manual control
-        goal_theta = 0
-        controller.take_measurements()
-        while not rospy.is_shutdown():
-            print("\nEnter 'a', 'w', 's', 'd' to move the robot:")
-            uinput = input("")
-            if uinput == "w": # forward
-                ######### Your code starts here #########
-
-                ######### Your code ends here #########
-            elif uinput == "a": # left
-                ######### Your code starts here #########
-
-                ######### Your code ends here #########
-            elif uinput == "d": #right
-                ######### Your code starts here #########
-
-                ######### Your code ends here #########
-            elif uinput == "s": # backwards
-                ######### Your code starts here #########
-
-                ######### Your code ends here #########
-            else:
-                print("Invalid input")
-            ######### Your code starts here #########
-            controller.take_measurements()
-            ######### Your code ends here #########
-
         # Autonomous exploration
         ######### Your code starts here #########
         controller.autonomous_exploration()
@@ -405,3 +671,4 @@ if __name__ == "__main__":
 
     except rospy.ROSInterruptException:
         print("Shutting down...")
+
